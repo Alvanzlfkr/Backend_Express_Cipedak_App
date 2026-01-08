@@ -1,0 +1,4 @@
+{
+  "watch": ["."],
+  "ignore": ["wa-auth/*", "node_modules/*"]
+}
