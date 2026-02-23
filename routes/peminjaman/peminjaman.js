@@ -1,10 +1,11 @@
 import express from "express";
 import pool from "../../db.js";
-
+import dayjs from "dayjs";
+import { sendWA } from "../../services/whatsapp.service.js";
 const router = express.Router();
 
 /* ======================================================
-   🔹 HELPER : CEK TANGGAL LEWAT (TAMBAHAN)
+   HELPER : CEK TANGGAL LEWAT
 ====================================================== */
 function isPastDate(dateStr) {
   const today = new Date();
@@ -29,7 +30,7 @@ async function cekBentrok({
 }) {
   const statusFilter = "(status IS NULL OR status != 'DITOLAK')";
 
-  // ===== MODE SESI =====
+  // MODE SESI
   if (sesi) {
     const { rowCount } = await pool.query(
       `
@@ -40,7 +41,7 @@ async function cekBentrok({
           sesi = $3
           OR sesi = 'Sesi 1 & 2 (Full)'
           OR ($3 = 'Sesi 1 & 2 (Full)' AND sesi IN (
-            'Sesi 1 (09:00 - 12:00)',
+            'Sesi 1 (07:30 - 12:00)',
             'Sesi 2 (13:00 - 16:00)'
           ))
         )
@@ -49,13 +50,13 @@ async function cekBentrok({
       `,
       excludeId
         ? [ruangan_id, tanggal_pinjam, sesi, excludeId]
-        : [ruangan_id, tanggal_pinjam, sesi]
+        : [ruangan_id, tanggal_pinjam, sesi],
     );
 
-    if (rowCount) return "Sesi sudah dibooking atau sedang diajukan";
+    if (rowCount) return "Sesi sudah dibooking";
   }
 
-  // ===== MODE JAM (RPTRA) =====
+  // MODE JAM
   if (jam_mulai && jam_selesai) {
     const { rowCount } = await pool.query(
       `
@@ -68,7 +69,7 @@ async function cekBentrok({
       `,
       excludeId
         ? [ruangan_id, tanggal_pinjam, jam_mulai, jam_selesai, excludeId]
-        : [ruangan_id, tanggal_pinjam, jam_mulai, jam_selesai]
+        : [ruangan_id, tanggal_pinjam, jam_mulai, jam_selesai],
     );
 
     if (rowCount) return "Jam bentrok dengan peminjaman lain";
@@ -80,15 +81,14 @@ async function cekBentrok({
 /* ======================================================
    GET SEMUA PEMINJAMAN
 ====================================================== */
-router.get("/", async (req, res) => {
+router.get("/", async (_, res) => {
   try {
     const { rows } = await pool.query(`
       SELECT pr.*, r.nama AS ruangan_name, r.tipe AS ruangan_tipe
       FROM peminjaman_ruangan pr
       JOIN ruangan r ON r.id = pr.ruangan_id
-      ORDER BY pr.tanggal_pinjam DESC, pr.jam_mulai ASC
+      ORDER BY pr.tanggal_pinjam DESC
     `);
-
     res.json(rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -96,16 +96,22 @@ router.get("/", async (req, res) => {
 });
 
 /* ======================================================
-   CEK SESI / JAM YANG SUDAH DIPESAN (UNTUK FE)
+   GET : CEK BOOKING (UNTUK FE)
 ====================================================== */
 router.get("/cek", async (req, res) => {
   try {
-    const { ruangan_id, tanggal_pinjam } = req.query;
+    const { ruangan_id, tanggal_pinjam, exclude_id } = req.query;
 
     if (!ruangan_id || !tanggal_pinjam) {
-      return res
-        .status(400)
-        .json({ error: "ruangan_id & tanggal_pinjam wajib" });
+      return res.json([]); // ⛑️ selalu array
+    }
+
+    const params = [ruangan_id, tanggal_pinjam];
+    let excludeSql = "";
+
+    if (exclude_id) {
+      params.push(Number(exclude_id));
+      excludeSql = `AND id != $3`;
     }
 
     const { rows } = await pool.query(
@@ -115,11 +121,38 @@ router.get("/cek", async (req, res) => {
       WHERE ruangan_id = $1
         AND tanggal_pinjam = $2
         AND (status IS NULL OR status != 'DITOLAK')
+        ${excludeSql}
       `,
-      [ruangan_id, tanggal_pinjam]
+      params,
     );
 
-    res.json(rows);
+    res.json(rows); // ✅ ARRAY
+  } catch (err) {
+    console.error("CEK ERROR:", err);
+    res.json([]); // ⛑️ FE tidak boleh crash
+  }
+});
+
+/* ======================================================
+   GET PEMINJAMAN BY ID
+====================================================== */
+router.get("/:id", async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `
+      SELECT pr.*, r.nama AS ruangan_name, r.tipe AS ruangan_tipe
+      FROM peminjaman_ruangan pr
+      JOIN ruangan r ON r.id = pr.ruangan_id
+      WHERE pr.id = $1
+      `,
+      [req.params.id],
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ error: "Data tidak ditemukan" });
+    }
+
+    res.json(rows[0]);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -143,36 +176,24 @@ router.post("/", async (req, res) => {
       alamat,
       no_telepon,
       barang,
+      tanggal_kembali_barang,
       keperluan,
     } = req.body;
 
-    // 🔹 VALIDASI TANGGAL LEWAT (TAMBAHAN)
     if (isPastDate(tanggal_pinjam)) {
       return res.status(400).json({
-        error: "Tidak bisa menambah peminjaman untuk tanggal yang sudah lewat",
+        error: "Tidak bisa meminjam di tanggal yang sudah lewat",
       });
     }
 
-    // ===== VALIDASI DASAR =====
     if (!nik || nik.length !== 16 || isNaN(nik)) {
       return res.status(400).json({ error: "NIK harus 16 digit angka" });
     }
 
-    // ===== NORMALISASI SESI / JAM =====
-    let finalSesi = sesi || null;
-    let finalMulai = jam_mulai || null;
-    let finalSelesai = jam_selesai || null;
+    const finalSesi = sesi || null;
+    const finalMulai = finalSesi ? null : jam_mulai || null;
+    const finalSelesai = finalSesi ? null : jam_selesai || null;
 
-    if (finalSesi) {
-      finalMulai = null;
-      finalSelesai = null;
-    }
-
-    if (finalMulai && finalSelesai) {
-      finalSesi = null;
-    }
-
-    // ===== CEK BENTROK =====
     const bentrok = await cekBentrok({
       ruangan_id,
       tanggal_pinjam,
@@ -185,27 +206,18 @@ router.post("/", async (req, res) => {
       return res.status(409).json({ error: bentrok });
     }
 
-    // ===== INSERT =====
     const { rows } = await pool.query(
       `
       INSERT INTO peminjaman_ruangan
       (
-        tanggal,
-        tanggal_pinjam,
-        ruangan_id,
-        sesi,
-        jam_mulai,
-        jam_selesai,
-        nama_peminjam,
-        jabatan,
-        nik,
-        alamat,
-        no_telepon,
-        barang,
-        keperluan
+        tanggal, tanggal_pinjam, ruangan_id,
+        sesi, jam_mulai, jam_selesai,
+        nama_peminjam, jabatan, nik,
+        alamat, no_telepon, barang,
+        tanggal_kembali_barang, keperluan
       )
       VALUES
-      ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+      ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
       RETURNING *
       `,
       [
@@ -221,16 +233,16 @@ router.post("/", async (req, res) => {
         alamat || null,
         no_telepon || null,
         barang || null,
+        tanggal_kembali_barang || null,
         keperluan || null,
-      ]
+      ],
     );
 
     res.status(201).json({
-      message: "Peminjaman berhasil ditambahkan",
+      message: "Peminjaman berhasil diajukan",
       data: rows[0],
     });
   } catch (err) {
-    console.error("POST ERROR:", err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -241,111 +253,172 @@ router.post("/", async (req, res) => {
 router.put("/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const {
-      tanggal,
-      tanggal_pinjam,
-      ruangan_id,
-      sesi,
-      jam_mulai,
-      jam_selesai,
-      nama_peminjam,
-      jabatan,
-      nik,
-      alamat,
-      no_telepon,
-      barang,
-      keperluan,
-    } = req.body;
+    const body = req.body;
 
-    // 🔹 VALIDASI TANGGAL LEWAT (TAMBAHAN)
-    if (isPastDate(tanggal_pinjam)) {
+    if (!body.tanggal_pinjam) {
       return res.status(400).json({
-        error: "Tidak bisa mengubah peminjaman ke tanggal yang sudah lewat",
+        error: "Tanggal pinjam wajib dikirim",
       });
     }
 
-    // ===== VALIDASI =====
-    if (!nik || nik.length !== 16 || isNaN(nik)) {
-      return res.status(400).json({ error: "NIK harus 16 digit angka" });
+    const { rows: old } = await pool.query(
+      "SELECT tanggal_pinjam FROM peminjaman_ruangan WHERE id = $1",
+      [id],
+    );
+
+    if (!old.length) {
+      return res.status(404).json({ error: "Data tidak ditemukan" });
     }
 
-    // ===== NORMALISASI SESI / JAM =====
-    let finalSesi = sesi || null;
-    let finalMulai = jam_mulai || null;
-    let finalSelesai = jam_selesai || null;
-
-    if (finalSesi) {
-      finalMulai = null;
-      finalSelesai = null;
+    if (
+      !dayjs(old[0].tanggal_pinjam).isSame(dayjs(body.tanggal_pinjam), "day") &&
+      isPastDate(body.tanggal_pinjam)
+    ) {
+      return res.status(400).json({
+        error: "Tanggal pinjam tidak boleh tanggal lampau",
+      });
     }
 
-    if (finalMulai && finalSelesai) {
-      finalSesi = null;
-    }
-
-    // ===== CEK BENTROK (EXCLUDE DIRI SENDIRI) =====
     const bentrok = await cekBentrok({
-      ruangan_id,
-      tanggal_pinjam,
-      sesi: finalSesi,
-      jam_mulai: finalMulai,
-      jam_selesai: finalSelesai,
-      excludeId: id,
+      ruangan_id: body.ruangan_id,
+      tanggal_pinjam: body.tanggal_pinjam,
+      sesi: body.sesi || null,
+      jam_mulai: body.jam_mulai || null,
+      jam_selesai: body.jam_selesai || null,
+      excludeId: Number(id),
     });
 
     if (bentrok) {
       return res.status(409).json({ error: bentrok });
     }
 
-    // ===== UPDATE =====
-    const { rows, rowCount } = await pool.query(
+    const { rows } = await pool.query(
       `
       UPDATE peminjaman_ruangan
       SET
-        tanggal = $1,
-        tanggal_pinjam = $2,
-        ruangan_id = $3,
-        sesi = $4,
-        jam_mulai = $5,
-        jam_selesai = $6,
-        nama_peminjam = $7,
-        jabatan = $8,
-        nik = $9,
-        alamat = $10,
-        no_telepon = $11,
-        barang = $12,
-        keperluan = $13
-      WHERE id = $14
+        tanggal=$1,
+        tanggal_pinjam=$2,
+        ruangan_id=$3,
+        sesi=$4,
+        jam_mulai=$5,
+        jam_selesai=$6,
+        nama_peminjam=$7,
+        jabatan=$8,
+        nik=$9,
+        alamat=$10,
+        no_telepon=$11,
+        barang=$12,
+        tanggal_kembali_barang=$13,
+        keperluan=$14
+      WHERE id=$15
       RETURNING *
       `,
       [
-        tanggal,
-        tanggal_pinjam,
-        ruangan_id,
-        finalSesi,
-        finalMulai,
-        finalSelesai,
-        nama_peminjam,
-        jabatan || null,
-        nik,
-        alamat || null,
-        no_telepon || null,
-        barang || null,
-        keperluan || null,
+        body.tanggal,
+        body.tanggal_pinjam,
+        body.ruangan_id,
+        body.sesi || null,
+        body.jam_mulai || null,
+        body.jam_selesai || null,
+        body.nama_peminjam,
+        body.jabatan || null,
+        body.nik,
+        body.alamat || null,
+        body.no_telepon || null,
+        body.barang || null,
+        body.tanggal_kembali_barang || null,
+        body.keperluan || null,
         id,
-      ]
+      ],
     );
 
-    if (rowCount === 0) {
-      return res.status(404).json({ error: "Data tidak ditemukan" });
+    res.json({ message: "Data berhasil diperbarui", data: rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
+   PUT : VALIDASI (APPROVE / REJECT + WA LENGKAP)
+====================================================== */
+router.put("/:id/validasi", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, admin_id } = req.body;
+    const statusEmoji = status === "DISETUJUI" ? "✅" : "❌";
+
+    if (!["DISETUJUI", "DITOLAK"].includes(status)) {
+      return res.status(400).json({ error: "Status tidak valid" });
     }
 
-    res.json({
-      message: "Data berhasil diperbarui",
-      data: rows[0],
-    });
+    const { rows } = await pool.query(
+      `
+      SELECT pr.*, r.nama AS ruangan_name
+      FROM peminjaman_ruangan pr
+      JOIN ruangan r ON r.id = pr.ruangan_id
+      WHERE pr.id = $1
+      `,
+      [id],
+    );
+
+    if (!rows.length)
+      return res.status(404).json({ error: "Data tidak ditemukan" });
+
+    const d = rows[0];
+
+    await pool.query(
+      `
+      UPDATE peminjaman_ruangan
+      SET status=$1,
+          validated_at=NOW(),
+          validated_by=$2
+      WHERE id=$3
+      `,
+      [status, admin_id || null, id],
+    );
+
+    // ===================== WA =====================
+    if (d.no_telepon) {
+      const tanggalPinjamText = new Date(d.tanggal_pinjam).toLocaleDateString(
+        "id-ID",
+        {
+          weekday: "long",
+          day: "2-digit",
+          month: "long",
+          year: "numeric",
+        },
+      );
+      const waktuText = d.sesi
+        ? d.sesi
+        : `${d.jam_mulai?.slice(0, 5) || "-"} - ${d.jam_selesai?.slice(0, 5) || "-"}`;
+
+      const pesan = `
+Halo *${d.nama_peminjam}*
+
+Peminjaman ruangan Anda:
+🏢 Ruangan : ${d.ruangan_name}
+📅 Tanggal : ${tanggalPinjamText}
+⏰ Waktu   : ${waktuText}
+
+Status : ${statusEmoji} *${status}*
+
+Silahkan datang sesuai jadwal dengan membawa identitas diri (KTP/SIM) dan menunjukkan pesan ini kepada petugas kami.
+
+Terima kasih.
+Kelurahan Cipedak
+`;
+
+      try {
+        await sendWA(d.no_telepon, pesan);
+        console.log("✅ WA terkirim ke", d.no_telepon);
+      } catch (err) {
+        console.error("❌ Gagal kirim WA:", err.message);
+      }
+    }
+
+    res.json({ message: `Peminjaman ${status}` });
   } catch (err) {
-    console.error("PUT ERROR:", err);
+    console.error(err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -356,11 +429,11 @@ router.put("/:id", async (req, res) => {
 router.delete("/:id", async (req, res) => {
   try {
     const { rowCount } = await pool.query(
-      "DELETE FROM peminjaman_ruangan WHERE id = $1",
-      [req.params.id]
+      "DELETE FROM peminjaman_ruangan WHERE id=$1",
+      [req.params.id],
     );
 
-    if (rowCount === 0) {
+    if (!rowCount) {
       return res.status(404).json({ error: "Data tidak ditemukan" });
     }
 

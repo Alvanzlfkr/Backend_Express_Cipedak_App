@@ -1,101 +1,99 @@
 import pool from "../db.js";
 
-// GET ALL
+// ================= GET ALL =================
 export const getAllPenanganan = async (req, res) => {
   try {
-    const result = await db.query(
-      "SELECT * FROM penanganan ORDER BY created_at DESC"
+    const result = await pool.query(
+      "SELECT * FROM penanganan ORDER BY jabatan",
     );
     res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ message: "Gagal mengambil data" });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
   }
 };
 
-// GET BY ID
+// ================= GET BY ID =================
 export const getPenangananById = async (req, res) => {
-  const { id } = req.params;
   try {
-    const result = await db.query("SELECT * FROM penanganan WHERE id = $1", [
+    const { id } = req.params;
+
+    const result = await pool.query("SELECT * FROM penanganan WHERE id = $1", [
       id,
     ]);
 
-    if (result.rows.length === 0)
+    if (result.rows.length === 0) {
       return res.status(404).json({ message: "Data tidak ditemukan" });
+    }
 
     res.json(result.rows[0]);
-  } catch (err) {
-    res.status(500).json({ message: "Terjadi kesalahan" });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
   }
 };
 
-// CREATE
+// ================= CREATE =================
 export const createPenanganan = async (req, res) => {
-  const { keterangan, jenis } = req.body;
-
-  // VALIDASI BACKEND
-  if (!keterangan || !jenis) {
-    return res.status(400).json({
-      message: "Keterangan dan jenis wajib diisi",
-    });
-  }
-
   try {
-    const result = await db.query(
-      `INSERT INTO penanganan (keterangan, jenis)
-       VALUES ($1, $2) RETURNING *`,
-      [keterangan, jenis]
+    const { nama, nip, jabatan } = req.body;
+
+    if (!nama || !nip || !jabatan) {
+      return res.status(400).json({ message: "Data tidak lengkap" });
+    }
+
+    if (!/^\d{5,25}$/.test(nip)) {
+      return res.status(400).json({
+        message: "NIP harus 5–25 digit angka",
+      });
+    }
+
+    await pool.query(
+      `INSERT INTO penanganan (nama, nip, jabatan)
+       VALUES ($1, $2, $3)`,
+      [nama, nip, jabatan],
     );
 
-    res.status(201).json(result.rows[0]);
-  } catch (err) {
-    res.status(500).json({ message: "Gagal menambah data" });
+    res.status(201).json({ message: "Data berhasil ditambahkan" });
+  } catch (error) {
+    console.error("POSTGRES ERROR:", error);
+
+    // UNIQUE jabatan
+    if (error.code === "23505") {
+      return res.status(400).json({
+        message: "Jabatan tersebut sudah terisi",
+      });
+    }
+
+    res.status(500).json({ message: "Gagal menyimpan data" });
   }
 };
 
-// UPDATE
+// ================= UPDATE =================
 export const updatePenanganan = async (req, res) => {
-  const { id } = req.params;
-  const { keterangan, jenis } = req.body;
-
-  if (!keterangan || !jenis) {
-    return res.status(400).json({
-      message: "Keterangan dan jenis wajib diisi",
-    });
-  }
-
   try {
-    const result = await db.query(
+    const { id } = req.params;
+    const { nama, nip } = req.body;
+
+    if (!nama || !nip) {
+      return res.status(400).json({ message: "Data tidak lengkap" });
+    }
+
+    if (!/^\d{5,25}$/.test(nip)) {
+      return res.status(400).json({
+        message: "NIP harus 5–25 digit angka",
+      });
+    }
+
+    await pool.query(
       `UPDATE penanganan
-       SET keterangan = $1, jenis = $2, updated_at = CURRENT_TIMESTAMP
-       WHERE id = $3 RETURNING *`,
-      [keterangan, jenis, id]
+       SET nama = $1, nip = $2
+       WHERE id = $3`,
+      [nama, nip, id],
     );
 
-    if (result.rows.length === 0)
-      return res.status(404).json({ message: "Data tidak ditemukan" });
+    res.json({ message: "Data berhasil diperbarui" });
+  } catch (error) {
+    console.error("UPDATE ERROR:", error);
 
-    res.json(result.rows[0]);
-  } catch (err) {
     res.status(500).json({ message: "Gagal update data" });
-  }
-};
-
-// DELETE
-export const deletePenanganan = async (req, res) => {
-  const { id } = req.params;
-
-  try {
-    const result = await db.query(
-      "DELETE FROM penanganan WHERE id = $1 RETURNING *",
-      [id]
-    );
-
-    if (result.rows.length === 0)
-      return res.status(404).json({ message: "Data tidak ditemukan" });
-
-    res.json({ message: "Data berhasil dihapus" });
-  } catch (err) {
-    res.status(500).json({ message: "Gagal menghapus data" });
   }
 };
