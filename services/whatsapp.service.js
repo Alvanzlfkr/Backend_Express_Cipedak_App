@@ -1,9 +1,6 @@
 console.log("📦 whatsapp.service.js LOADED");
 
-import makeWASocket, {
-  useMultiFileAuthState,
-  DisconnectReason,
-} from "@whiskeysockets/baileys";
+import baileys from "@whiskeysockets/baileys";
 import fs from "fs";
 import QRCode from "qrcode";
 import pino from "pino";
@@ -31,6 +28,12 @@ const logger = pino({
 export async function initWhatsApp() {
   if (isConnecting) return;
   isConnecting = true;
+
+  const {
+    default: makeWASocket,
+    useMultiFileAuthState,
+    DisconnectReason,
+  } = baileys;
 
   try {
     if (sock) {
